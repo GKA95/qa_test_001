@@ -1,43 +1,45 @@
-import express, {
-  NextFunction,
-  Request,
-  Response as ExpressResponse,
-} from "express";
+// src/app.ts
+import express, { NextFunction, Request, Response as ExpressResponse } from "express";
 import { promises as fs } from "node:fs";
 import path from "node:path";
 
-const VALIDATION_URL = "https://schoolbaseapp.com/validate-name";
+const VALIDATION_URL = process.env.VALIDATION_URL ?? "http://localhost:4000/validate-name"; // default to mock
 const USERS_PATH = path.resolve(__dirname, "../data/users.json");
 
-const app = express();
+export const app = express();
 
+/** Health */
 app.get("/health", (_req: Request, res: ExpressResponse) => {
   res.json({ status: "ok" });
 });
 
+/** /api/validate-users - read all names, validate each, return structured JSON */
 app.get(
   "/api/validate-users",
   async (_req: Request, res: ExpressResponse, next: NextFunction) => {
     try {
       const users = await loadUsers();
+      const results: Array<{ name: string; valid: boolean; message: string }> = [];
 
       for (const name of users) {
-        await validateUser(name);
+        const result = await validateUser(name);
+        results.push(result);
       }
 
-      res.json({ validated: users.length });
+      res.json({ validated: results.length, results });
     } catch (error) {
       next(error);
     }
-  },
+  }
 );
 
+/** Error handler */
 app.use(
   (
     error: unknown,
     _req: Request,
     res: ExpressResponse,
-    _next: NextFunction,
+    _next: NextFunction
   ) => {
     if (res.headersSent) {
       return;
@@ -49,14 +51,10 @@ app.use(
         : "Unexpected error while validating user names.";
 
     res.status(500).json({ error: message });
-  },
+  }
 );
 
-const port = Number(process.env.PORT ?? 3000);
-
-app.listen(port, () => {
-  console.log(`Server listening on port ${port}`);
-});
+/** Helpers & validation logic */
 
 type RemoteResponse = {
   message?: string;
@@ -68,26 +66,44 @@ async function loadUsers(): Promise<string[]> {
   return JSON.parse(raw) as string[];
 }
 
-async function validateUser(name: string): Promise<void> {
-  const url = `${VALIDATION_URL}?name=${encodeURIComponent(name)}`;
+/** Clean and normalize names before sending to remote validator */
+export function cleanName(name: string): string {
+  // Normalize accented letters to ASCII equivalents (NFD + remove diacritics)
+  let cleaned = name.normalize("NFD").replace(/[\u0300-\u036f]/g, "");
+  // Replace curly/smart quotes with ASCII apostrophe
+  cleaned = cleaned.replace(/[‘’]/g, "'");
+  // Optionally remove characters that are not letters, apostrophe or space (keep digits if you want)
+  // cleaned = cleaned.replace(/[^A-Za-z' ]+/g, "");
+  cleaned = cleaned.trim();
+  return cleaned;
+}
 
-  let response: Response;
+/** Validate single user: returns object, never exits process */
+export async function validateUser(name: string): Promise<{ name: string; valid: boolean; message: string }> {
+  const clean = cleanName(name);
+  const url = `${VALIDATION_URL}?name=${encodeURIComponent(clean)}`;
+
+  // Informational log if we changed the name
+  if (clean !== name) {
+    console.log(`Normalized "${name}" → "${clean}"`);
+  }
 
   try {
-    response = await fetch(url);
+    const response = await fetch(url);
+    const message = await extractMessage(response);
+
+    if (response.status !== 200) {
+      console.error(`${name} - ${message}`);
+      return { name, valid: false, message };
+    }
+
+    console.log(`${name} - ${message}`);
+    return { name, valid: true, message };
   } catch (_error) {
-    console.error(`${name} - Failed to reach validation service.`);
-    process.exit(1);
+    // Don't crash the server; return a failure result to the caller
+    console.error(`${name} - Service unreachable.`);
+    return { name, valid: false, message: "Service unreachable" };
   }
-
-  const message = await extractMessage(response);
-
-  if (response.status !== 200) {
-    console.error(`${name} - ${message}`);
-    process.exit(1);
-  }
-
-  console.log(`${name} - ${message}`);
 }
 
 async function extractMessage(response: Response): Promise<string> {
@@ -97,10 +113,9 @@ async function extractMessage(response: Response): Promise<string> {
       return payload.message;
     }
   } catch (_error) {
-    // Ignore JSON parse errors, they are handled below.
+    // ignore parse errors
   }
-
   return `Received status ${response.status}`;
 }
 
-export {};
+export default app;
